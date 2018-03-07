@@ -4,10 +4,10 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
@@ -23,18 +23,7 @@ type HuoBi_V2 struct {
 	baseUrl,
 	accessKey,
 	secretKey string
-	c              *websocket.Conn
-	depthChanMap   map[string]chan *Depth
-	tradeChanMap   map[string]chan []Trade
-	channelMap     map[string]int
-	writeMsgChan   chan interface{}
-	writeErrorChan chan error
 }
-
-const (
-	DEPTH_CHANNEL = iota
-	TRADE_CHANNEL
-)
 
 type response struct {
 	Status  string          `json:"status"`
@@ -43,24 +32,9 @@ type response struct {
 	Errcode string          `json:"err-code"`
 }
 
-func NewV2(client *http.Client, accessKey, secretKey string) *HuoBi_V2 {
-	return &HuoBi_V2{
-		httpClient: client,
-		accessKey:  accessKey,
-		secretKey:  secretKey,
-		baseUrl:    "https://be.huobi.com",
-
-		tradeChanMap:   map[string]chan []Trade{},
-		depthChanMap:   map[string]chan *Depth{},
-		channelMap:     map[string]int{},
-		writeMsgChan:   make(chan interface{}),
-		writeErrorChan: make(chan error),
-	}
+func NewV2(httpClient *http.Client, accessKey, secretKey, clientId string) *HuoBi_V2 {
+	return &HuoBi_V2{httpClient, clientId, "https://be.huobi.com", accessKey, secretKey}
 }
-
-//func NewV2(httpClient *http.Client, accessKey, secretKey, clientId string) *HuoBi_V2 {
-//return &HuoBi_V2{httpClient, clientId, "https://be.huobi.com", accessKey, secretKey}
-//}
 
 func (hbV2 *HuoBi_V2) GetAccountId() (string, error) {
 	path := "/v1/account/accounts"
@@ -496,225 +470,33 @@ func (hbV2 *HuoBi_V2) toJson(params url.Values) string {
 	return string(jsonData)
 }
 
-func (hb *HuoBi_V2) connectWebsocket() error {
-	url := "wss://api.huobi.pro/ws"
-	var err error
-	hb.c, _, err = websocket.DefaultDialer.Dial(url, nil)
-	if err != nil {
-		return errors.Wrap(err, fmt.Sprintf("websocket dial %s", url))
-	}
-	return nil
-}
-
-func (hb *HuoBi_V2) writeWebsocketMessage(msg interface{}) error {
-	hb.writeMsgChan <- msg
-	return <-hb.writeErrorChan
-}
-
-func (hb *HuoBi_V2) RunWebsocket() error {
-	if err := hb.connectWebsocket(); err != nil {
-		return err
-	}
-
-	go func() {
-		ticker := time.NewTicker(time.Duration(5) * time.Second)
-		for {
-			select {
-			case <-ticker.C:
-				err := hb.c.WriteJSON(map[string]string{
-					"event": "ping",
-				})
-				if err != nil {
-					log.Printf("write ping: %v\n", err)
-					if err := hb.connectWebsocket(); err != nil {
-						log.Printf("reconnect websocket failed: %v\n", err)
-					}
-				}
-			case msg := <-hb.writeMsgChan:
-				hb.writeErrorChan <- hb.c.WriteJSON(msg)
-			}
-		}
-	}()
-
-	msgChan := make(chan map[string]interface{})
-
-	go func() {
-		for {
-			_, reader, err := hb.c.NextReader()
-			if err != nil {
-				log.Printf("get next reader: %v\n", err)
-				continue
-			}
-			gzipReader, err := gzip.NewReader(reader)
-			if err != nil {
-				log.Printf("new gzip reader: %v\n", err)
-				continue
-			}
-			jsonReader := json.NewDecoder(gzipReader)
-
-			var msgmap map[string]interface{}
-			if err := jsonReader.Decode(&msgmap); err != nil {
-				log.Printf("decode json: %v\n", err)
-				continue
-			}
-
-			if ping, isok := msgmap["ping"].(int64); isok {
-				if err := hb.writeWebsocketMessage(map[string]int64{"pong": ping}); err != nil {
-					log.Printf("write pong failed: %v\n", err)
-				}
-				continue
-			}
-
-			if _, isok := msgmap["pong"].(int64); isok {
-				continue
-			}
-
-			if _, isok := msgmap["subbed"].(string); isok {
-			}
-
-			msgChan <- msgmap
-		}
-	}()
-
-	go func() {
-		for {
-			select {
-			case msgmap := <-msgChan:
-				var isok bool
-				var channel string
-				var channelType int
-
-				if channel, isok = msgmap["channel"].(string); !isok {
-					log.Printf("miss channel, msg map: %v\n", msgmap)
-					continue
-				}
-
-				if channel == "addChannel" {
-					//log.Printf("add %s channel success\n", msgmap["data"].(map[string]interface{})["channel"])
-					continue
-				}
-
-				if channelType, isok = hb.channelMap[channel]; !isok {
-					log.Printf("receive unknown channel(%s) message(%v)\n", channel, msgmap)
-					continue
-				}
-
-				if channelType == DEPTH_CHANNEL {
-					d, err := dataToDepth(msgmap["data"])
-					if err != nil {
-						log.Printf("convert data to depth: %v\n", err)
-						continue
-					}
-					hb.depthChanMap[channel] <- d
-				} else if channelType == TRADE_CHANNEL {
-					t, err := dataToTrades(msgmap["data"])
-					if err != nil {
-						log.Printf("convert data to trades: %v\n", err)
-						continue
-					}
-					hb.tradeChanMap[channel] <- t
-				}
-			}
-		}
-	}()
-
-	return nil
-}
-
-func dataToDepth(data interface{}) (*Depth, error) {
-	var isok bool
-	var bids, asks []interface{}
-	var depthdata map[string]interface{}
-	if depthdata, isok = data.(map[string]interface{}); !isok {
-		return nil, errors.Errorf("data type is not map[string]interface{}: %v\n", data)
-	}
-	bids, _ = depthdata["bids"].([]interface{})
-	asks, _ = depthdata["asks"].([]interface{})
-
-	d := new(Depth)
-	for _, r := range asks {
-		var dr DepthRecord
-		rr := r.([]interface{})
-		dr.Price = ToFloat64(rr[0])
-		dr.Amount = ToFloat64(rr[1])
-		d.AskList = append(d.AskList, dr)
-	}
-
-	for _, r := range bids {
-		var dr DepthRecord
-		rr := r.([]interface{})
-		dr.Price = ToFloat64(rr[0])
-		dr.Amount = ToFloat64(rr[1])
-		d.BidList = append(d.BidList, dr)
-	}
-	return d, nil
-}
-
-func dataToTrades(data interface{}) ([]Trade, error) {
-	var tradesdata []interface{}
-	var trades []Trade
-	var isok bool
-	if tradesdata, isok = data.([]interface{}); !isok {
-		return nil, errors.Errorf("data type is not []interface{} %v\n", tradesdata)
-	}
-
-	for _, d := range tradesdata {
-		dd := d.([]interface{})
-		t := Trade{}
-		t.Tid = ToInt64(dd[0])
-		t.Price = ToFloat64(dd[1])
-		t.Amount = ToFloat64(dd[2])
-
-		now := time.Now()
-		timeStr := dd[3].(string)
-		timeMeta := strings.Split(timeStr, ":")
-		h, _ := strconv.Atoi(timeMeta[0])
-		m, _ := strconv.Atoi(timeMeta[1])
-		s, _ := strconv.Atoi(timeMeta[2])
-		//临界点处理
-		if now.Hour() == 0 {
-			if h <= 23 && h >= 20 {
-				pre := now.AddDate(0, 0, -1)
-				t.Date = time.Date(pre.Year(), pre.Month(), pre.Day(), h, m, s, 0, time.Local).Unix() * 1000
-			} else if h == 0 {
-				t.Date = time.Date(now.Year(), now.Month(), now.Day(), h, m, s, 0, time.Local).Unix() * 1000
-			}
-		} else {
-			t.Date = time.Date(now.Year(), now.Month(), now.Day(), h, m, s, 0, time.Local).Unix() * 1000
-		}
-
-		t.Type = dd[4].(string)
-		trades = append(trades, t)
-	}
-	return trades, nil
-}
-
 func (hb *HuoBi_V2) GetDepthChan(pair CurrencyPair) (chan *Depth, chan struct{}, error) {
-	channel := fmt.Sprintf("market.%s.depth.%s", strings.ToLower(pair.ToSymbol("")), "step0")
-	msg := map[string]interface{}{
-		"sub": channel,
-		"id":  "thb",
-		//"pick": []string{"bids.100", "asks.100"},
+	c, resp, err := websocket.DefaultDialer.Dial("wss://api.huobi.pro/ws", nil)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "dial websocket")
 	}
-
-	depth := make(chan *Depth)
-	hb.depthChanMap[channel] = depth
-	hb.channelMap[channel] = DEPTH_CHANNEL
-
-	if err := hb.writeWebsocketMessage(msg); err != nil {
-		return nil, nil, errors.Wrapf(err, "write depth message: %v", msg)
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "read body")
 	}
+	fmt.Println(body)
+	c.WriteJSON(map[string]interface{}{
+		"sub":  fmt.Sprintf("market.%s.depth.%s", strings.ToLower(pair.ToSymbol("")), "step0"),
+		"id":   "thb",
+		"pick": []string{"bids.100", "asks.100"},
+	})
 
 	done := make(chan struct{})
-	return depth, done, nil
+	depth := make(chan *Depth)
 
 	go func() {
-		defer hb.c.Close()
+		defer c.Close()
 		defer close(done)
 		for {
 			select {
 			default:
-				_, reader, err := hb.c.NextReader()
+				_, reader, err := c.NextReader()
 				if err != nil {
 					log.Printf("get next reader: %v\n", err)
 					return
